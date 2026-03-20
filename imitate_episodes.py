@@ -9,14 +9,8 @@ from tqdm import tqdm
 from einops import rearrange
 
 from constants import DT
-from constants import PUPPET_GRIPPER_JOINT_OPEN
-from utils import load_data # data functions
-from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
-from visualize_episodes import save_videos
-
-from sim_env import BOX_POSE
 
 import IPython
 e = IPython.embed
@@ -35,19 +29,36 @@ def main(args):
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
-    if is_sim:
+    is_libero = task_name.startswith('libero_')
+
+    if is_libero:
+        from constants import LIBERO_TASK_CONFIGS
+        task_config = LIBERO_TASK_CONFIGS[task_name]
+        dataset_path = task_config['dataset_path']
+        camera_names = task_config['camera_names']
+        episode_len = task_config.get('episode_len', 300)
+        state_dim = task_config.get('state_dim', 9)
+        action_dim = task_config.get('action_dim', 7)
+    elif is_sim:
         from constants import SIM_TASK_CONFIGS
         task_config = SIM_TASK_CONFIGS[task_name]
+        dataset_dir = task_config['dataset_dir']
+        num_episodes = task_config['num_episodes']
+        episode_len = task_config['episode_len']
+        camera_names = task_config['camera_names']
+        state_dim = 14
+        action_dim = 14
     else:
         from aloha_scripts.constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
-    episode_len = task_config['episode_len']
-    camera_names = task_config['camera_names']
+        dataset_dir = task_config['dataset_dir']
+        num_episodes = task_config['num_episodes']
+        episode_len = task_config['episode_len']
+        camera_names = task_config['camera_names']
+        state_dim = 14
+        action_dim = 14
 
     # fixed parameters
-    state_dim = 14
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -65,10 +76,15 @@ def main(args):
                          'dec_layers': dec_layers,
                          'nheads': nheads,
                          'camera_names': camera_names,
+                         'state_dim': state_dim,
+                         'action_dim': action_dim,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names,}
+                         'camera_names': camera_names,
+                         'state_dim': state_dim,
+                         'action_dim': action_dim,
+                         }
     else:
         raise NotImplementedError
 
@@ -77,6 +93,7 @@ def main(args):
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
+        'action_dim': action_dim,
         'lr': args['lr'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
@@ -85,7 +102,8 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim and not is_libero,
+        'is_libero': is_libero,
     }
 
     if is_eval:
@@ -100,7 +118,15 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    # Load data
+    if is_libero:
+        from utils import load_libero_data
+        train_dataloader, val_dataloader, stats, _ = load_libero_data(
+            dataset_path, camera_names, batch_size_train, chunk_size=args['chunk_size'])
+    else:
+        from utils import load_data
+        train_dataloader, val_dataloader, stats, _ = load_data(
+            dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -139,9 +165,27 @@ def make_optimizer(policy_class, policy):
 
 
 def get_image(ts, camera_names):
+    """Extract images from dm_control timestep (for ALOHA sim eval only)."""
     curr_images = []
     for cam_name in camera_names:
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
+        curr_images.append(curr_image)
+    curr_image = np.stack(curr_images, axis=0)
+    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
+    return curr_image
+
+
+def get_libero_image(obs, camera_names):
+    """Extract images from LIBERO obs dict."""
+    # LIBERO camera name mapping: the obs dict uses different keys than the HDF5
+    libero_cam_key_map = {
+        'agentview_rgb': 'agentview_image',
+        'eye_in_hand_rgb': 'robot0_eye_in_hand_image',
+    }
+    curr_images = []
+    for cam_name in camera_names:
+        obs_key = libero_cam_key_map.get(cam_name, cam_name)
+        curr_image = rearrange(obs[obs_key], 'h w c -> c h w')
         curr_images.append(curr_image)
     curr_image = np.stack(curr_images, axis=0)
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
@@ -152,7 +196,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
     set_seed(1000)
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
+    action_dim = config['action_dim']
     real_robot = config['real_robot']
+    is_libero = config.get('is_libero', False)
     policy_class = config['policy_class']
     onscreen_render = config['onscreen_render']
     policy_config = config['policy_config']
@@ -160,7 +206,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
     max_timesteps = config['episode_len']
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
-    onscreen_cam = 'angle'
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
@@ -178,9 +223,39 @@ def eval_bc(config, ckpt_name, save_episode=True):
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
     # load environment
-    if real_robot:
-        from aloha_scripts.robot_utils import move_grippers # requires aloha
-        from aloha_scripts.real_env import make_real_env # requires aloha
+    if is_libero:
+        from libero.libero import benchmark
+        from libero.libero.envs import OffScreenRenderEnv
+        from libero.libero import get_libero_path
+
+        # Determine suite and task_id from task_name
+        # You may need to customize this mapping for your specific task
+        benchmark_dict = benchmark.get_benchmark_dict()
+        # Default to libero_90 suite; adjust as needed
+        suite_name = task_name  # e.g. 'libero_90', 'libero_10'
+        if suite_name not in benchmark_dict:
+            # Try extracting suite from task name, or default
+            suite_name = 'libero_90'
+        task_suite = benchmark_dict[suite_name]()
+        task_id = 0  # TODO: set this based on your specific task
+
+        task = task_suite.get_task(task_id)
+        task_bddl_file = os.path.join(
+            get_libero_path("bddl_files"),
+            task.problem_folder,
+            task.bddl_file
+        )
+        env = OffScreenRenderEnv(
+            bddl_file_name=task_bddl_file,
+            camera_heights=128,
+            camera_widths=128
+        )
+        env.seed(0)
+        init_states = task_suite.get_task_init_states(task_id)
+        env_max_reward = 1  # LIBERO uses sparse reward: 1 on success
+    elif real_robot:
+        from aloha_scripts.robot_utils import move_grippers
+        from aloha_scripts.real_env import make_real_env
         env = make_real_env(init_node=True)
         env_max_reward = 0
     else:
@@ -200,48 +275,70 @@ def eval_bc(config, ckpt_name, save_episode=True):
     highest_rewards = []
     for rollout_id in range(num_rollouts):
         rollout_id += 0
-        ### set task
-        if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
-        elif 'sim_insertion' in task_name:
-            BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
 
-        ts = env.reset()
+        if is_libero:
+            ### LIBERO environment reset
+            env.reset()
+            init_state_id = rollout_id % len(init_states)
+            env.set_init_state(init_states[init_state_id])
+            # Step a few times to let environment settle
+            dummy_action = [0.] * 7
+            for _ in range(10):
+                obs, _, _, _ = env.step(dummy_action)
+        else:
+            ### ALOHA sim environment reset
+            if 'sim_transfer_cube' in task_name:
+                from sim_env import BOX_POSE
+                from utils import sample_box_pose
+                BOX_POSE[0] = sample_box_pose()
+            elif 'sim_insertion' in task_name:
+                from sim_env import BOX_POSE
+                from utils import sample_insertion_pose
+                BOX_POSE[0] = np.concatenate(sample_insertion_pose())
 
-        ### onscreen render
-        if onscreen_render:
+            ts = env.reset()
+
+        ### onscreen render (ALOHA sim only)
+        if onscreen_render and not is_libero:
             ax = plt.subplot()
-            plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
+            plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id='angle'))
             plt.ion()
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
         rewards = []
+
         with torch.inference_mode():
             for t in range(max_timesteps):
-                ### update onscreen render and wait for DT
-                if onscreen_render:
-                    image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
-                    plt_img.set_data(image)
-                    plt.pause(DT)
-
-                ### process previous timestep to get qpos and image_list
-                obs = ts.observation
-                if 'images' in obs:
-                    image_list.append(obs['images'])
+                ### process observations
+                if is_libero:
+                    # LIBERO obs
+                    qpos_numpy = np.concatenate([
+                        obs['robot0_joint_pos'],      # (7,)
+                        obs['robot0_gripper_qpos'],   # (2,)
+                    ])
+                    qpos = pre_process(qpos_numpy)
+                    qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                    curr_image = get_libero_image(obs, camera_names)
                 else:
-                    image_list.append({'main': obs['image']})
-                qpos_numpy = np.array(obs['qpos'])
-                qpos = pre_process(qpos_numpy)
-                qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                    # ALOHA obs
+                    obs = ts.observation
+                    if 'images' in obs:
+                        image_list.append(obs['images'])
+                    else:
+                        image_list.append({'main': obs['image']})
+                    qpos_numpy = np.array(obs['qpos'])
+                    qpos = pre_process(qpos_numpy)
+                    qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
+                    curr_image = get_image(ts, camera_names)
+
                 qpos_history[:, t] = qpos
-                curr_image = get_image(ts, camera_names)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -267,20 +364,28 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 ### post-process actions
                 raw_action = raw_action.squeeze(0).cpu().numpy()
                 action = post_process(raw_action)
-                target_qpos = action
 
                 ### step the environment
-                ts = env.step(target_qpos)
-
-                ### for visualization
-                qpos_list.append(qpos_numpy)
-                target_qpos_list.append(target_qpos)
-                rewards.append(ts.reward)
+                if is_libero:
+                    obs, reward, done, info = env.step(action.tolist())
+                    rewards.append(reward)
+                    qpos_list.append(qpos_numpy)
+                    target_qpos_list.append(action)
+                    if done:
+                        break
+                else:
+                    target_qpos = action
+                    ts = env.step(target_qpos)
+                    qpos_list.append(qpos_numpy)
+                    target_qpos_list.append(target_qpos)
+                    rewards.append(ts.reward)
 
             plt.close()
+
         if real_robot:
-            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
-            pass
+            from constants import PUPPET_GRIPPER_JOINT_OPEN
+            from aloha_scripts.robot_utils import move_grippers
+            move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)
 
         rewards = np.array(rewards)
         episode_return = np.sum(rewards[rewards!=None])
@@ -289,13 +394,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
         highest_rewards.append(episode_highest_reward)
         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
 
-        if save_episode:
-            save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
+    if is_libero:
+        env.close()
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
-    for r in range(env_max_reward+1):
+    for r in range(int(env_max_reward)+1):
         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
         summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
@@ -431,5 +536,5 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-    
+
     main(vars(parser.parse_args()))

@@ -2,7 +2,8 @@ import numpy as np
 import torch
 import os
 import h5py
-from torch.utils.data import TensorDataset, DataLoader
+import glob
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 
 import IPython
 e = IPython.embed
@@ -187,3 +188,154 @@ def detach_dict(d):
 def set_seed(seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+###############################################################################
+# LIBERO dataset utilities
+###############################################################################
+
+class LIBERODataset(Dataset):
+    """
+    Dataset for LIBERO HDF5 files.
+    Each .hdf5 file contains multiple demos: /data/demo_0, /data/demo_1, ...
+    """
+    def __init__(self, dataset_path, camera_names, norm_stats):
+        """
+        Args:
+            dataset_path: path to a single .hdf5 file OR a directory of .hdf5 files
+            camera_names: e.g. ['agentview_rgb', 'eye_in_hand_rgb']
+            norm_stats: dict with 'qpos_mean', 'qpos_std', 'action_mean', 'action_std'
+        """
+        super().__init__()
+        self.camera_names = camera_names
+        self.norm_stats = norm_stats
+
+        # Build an index of (hdf5_path, demo_key, ep_len) tuples
+        self.samples = []
+        if os.path.isdir(dataset_path):
+            hdf5_files = sorted(glob.glob(os.path.join(dataset_path, '*.hdf5')))
+        else:
+            hdf5_files = [dataset_path]
+
+        for hdf5_path in hdf5_files:
+            with h5py.File(hdf5_path, 'r') as f:
+                demos = sorted(f['data'].keys())  # demo_0, demo_1, ...
+                for demo_key in demos:
+                    ep_len = f[f'data/{demo_key}/actions'].shape[0]
+                    self.samples.append((hdf5_path, demo_key, ep_len))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        hdf5_path, demo_key, ep_len = self.samples[index]
+
+        # Sample a random starting timestep
+        start_ts = np.random.choice(ep_len)
+
+        with h5py.File(hdf5_path, 'r') as root:
+            demo = root[f'data/{demo_key}']
+
+            # === Proprioception (qpos) ===
+            # LIBERO: joint_states (7,) + gripper_states (2,) = 9
+            joint_states = demo['obs/joint_states'][start_ts]       # (7,)
+            gripper_states = demo['obs/gripper_states'][start_ts]   # (2,)
+            qpos = np.concatenate([joint_states, gripper_states])   # (9,)
+
+            # === Actions ===
+            # LIBERO actions are (T, 7): 6 DOF delta + 1 gripper
+            action_len = ep_len - start_ts
+            action = demo['actions'][start_ts:]   # (remaining_T, 7)
+
+            # Pad to a fixed chunk size
+            action_chunk_size = self.norm_stats.get('action_chunk_size', 100)
+            padded_action = np.zeros((action_chunk_size, 7), dtype=np.float32)
+            is_pad = np.ones(action_chunk_size, dtype=bool)
+            actual_len = min(action_len, action_chunk_size)
+            padded_action[:actual_len] = action[:actual_len]
+            is_pad[:actual_len] = False
+
+            # === Images ===
+            all_cam_images = []
+            for cam_name in self.camera_names:
+                image = demo[f'obs/{cam_name}'][start_ts]  # (H, W, 3)
+                # Transpose to (3, H, W) for PyTorch
+                image = np.moveaxis(image, -1, 0)
+                all_cam_images.append(image)
+            all_cam_images = np.stack(all_cam_images, axis=0)  # (num_cams, 3, H, W)
+
+            # === Normalize ===
+            qpos = (qpos - self.norm_stats['qpos_mean']) / (self.norm_stats['qpos_std'] + 1e-6)
+            padded_action = (padded_action - self.norm_stats['action_mean']) / (self.norm_stats['action_std'] + 1e-6)
+            all_cam_images = all_cam_images / 255.0
+
+        # Convert to tensors
+        qpos = torch.from_numpy(qpos).float()
+        padded_action = torch.from_numpy(padded_action).float()
+        is_pad = torch.from_numpy(is_pad).bool()
+        all_cam_images = torch.from_numpy(all_cam_images).float()
+
+        return all_cam_images, qpos, padded_action, is_pad
+
+
+def get_libero_norm_stats(dataset_path, camera_names):
+    """
+    Compute normalization statistics across all demos in the dataset.
+    """
+    all_qpos = []
+    all_actions = []
+
+    if os.path.isdir(dataset_path):
+        hdf5_files = sorted(glob.glob(os.path.join(dataset_path, '*.hdf5')))
+    else:
+        hdf5_files = [dataset_path]
+
+    for hdf5_path in hdf5_files:
+        with h5py.File(hdf5_path, 'r') as f:
+            for demo_key in sorted(f['data'].keys()):
+                demo = f[f'data/{demo_key}']
+                joint_states = demo['obs/joint_states'][()]
+                gripper_states = demo['obs/gripper_states'][()]
+                qpos = np.concatenate([joint_states, gripper_states], axis=-1)
+                actions = demo['actions'][()]
+                all_qpos.append(qpos)
+                all_actions.append(actions)
+
+    all_qpos = np.concatenate(all_qpos, axis=0)
+    all_actions = np.concatenate(all_actions, axis=0)
+
+    # Clip std to avoid division by near-zero
+    qpos_std = np.clip(all_qpos.std(axis=0), 1e-2, np.inf)
+    action_std = np.clip(all_actions.std(axis=0), 1e-2, np.inf)
+
+    stats = {
+        'qpos_mean': all_qpos.mean(axis=0).astype(np.float32),
+        'qpos_std': qpos_std.astype(np.float32),
+        'action_mean': all_actions.mean(axis=0).astype(np.float32),
+        'action_std': action_std.astype(np.float32),
+    }
+    return stats
+
+
+def load_libero_data(dataset_path, camera_names, batch_size, chunk_size):
+    """
+    Replacement for ACT's load_data() function, for LIBERO datasets.
+    """
+    print(f'\nLIBERO data from: {dataset_path}\n')
+    # Compute stats
+    stats = get_libero_norm_stats(dataset_path, camera_names)
+    stats['action_chunk_size'] = chunk_size
+
+    # Build dataset
+    full_dataset = LIBERODataset(dataset_path, camera_names, stats)
+    print(f'Total LIBERO samples (demos): {len(full_dataset)}')
+
+    # Train/val split (90/10)
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    return train_loader, val_loader, stats, full_dataset

@@ -1,7 +1,7 @@
 import pathlib
 
 ### Task parameters
-DATA_DIR = '<put your data dir here>'
+DATA_DIR = '/ocean/projects/cis260038p/shared/datasets'
 SIM_TASK_CONFIGS = {
     'sim_transfer_cube_scripted':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
@@ -31,6 +31,39 @@ SIM_TASK_CONFIGS = {
         'camera_names': ['top']
     },
 }
+
+### LIBERO task parameters
+# dataset_path: path to a single .hdf5 file or a directory of .hdf5 files
+# camera_names: must match keys under /data/demo_X/obs/ in the HDF5 files
+LIBERO_TASK_CONFIGS = {
+    # --- LIBERO-90 (all tasks in the directory) ---
+    'libero_90': {
+        'dataset_path': DATA_DIR + '/libero/libero_90',
+        'episode_len': 300,
+        'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
+        'state_dim': 9,   # joint_states(7) + gripper_states(2)
+        'action_dim': 7,  # 6 DOF delta EE + 1 gripper
+    },
+
+    # --- LIBERO-10 (all tasks in the directory) ---
+    'libero_10': {
+        'dataset_path': DATA_DIR + '/libero/libero_10',
+        'episode_len': 300,
+        'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
+        'state_dim': 9,
+        'action_dim': 7,
+    },
+
+    # --- Example: single LIBERO task ---
+    'libero_kitchen_scene1_open_bottom_drawer': {
+        'dataset_path': DATA_DIR + '/libero/libero_90/KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo.hdf5',
+        'episode_len': 300,
+        'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
+        'state_dim': 9,
+        'action_dim': 7,
+    },
+}
+
 
 ### Simulation envs fixed constants
 DT = 0.02
