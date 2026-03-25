@@ -1,89 +1,94 @@
-# ACT: Action Chunking with Transformers
+# ACT-Tokenizer: Action Chunking with Transformers + Discrete Action Tokenization
 
-### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
-TL;DR: if your ACT policy is jerky or pauses in the middle of an episode, just train for longer! Success rate and smoothness can improve way after loss plateaus.
+Fork of [ACT](https://tonyzhaozh.github.io/aloha/) that adds discrete action tokenization (FAST+) to the CVAE. The CVAE encoder embeds discrete tokens instead of raw actions, and the decoder predicts token logits. After decoding, tokens are detokenized back to continuous actions.
 
-#### Project Website: https://tonyzhaozh.github.io/aloha/
+## Setup
 
-This repo contains the implementation of ACT, together with 2 simulated environments:
-Transfer Cube and Bimanual Insertion. You can train and evaluate ACT in sim or real.
-For real, you would also need to install [ALOHA](https://github.com/tonyzhaozh/aloha).
+```bash
+conda create -n aloha python=3.8.10
+conda activate aloha
 
-### Updates:
-You can find all scripted/human demo for simulated environments [here](https://drive.google.com/drive/folders/1gPR03v05S1xiInoVJn7G7VJ9pDCnxq9O?usp=share_link).
+# Core dependencies
+pip install torch torchvision
+pip install pyquaternion pyyaml rospkg pexpect
+pip install mujoco==2.3.7 dm_control==1.0.14
+pip install opencv-python matplotlib einops packaging h5py ipython
+pip install transformers  # for FAST tokenizer
 
+# Install DETR
+cd detr && pip install -e . && cd ..
 
-### Repo Structure
-- ``imitate_episodes.py`` Train and Evaluate ACT
-- ``policy.py`` An adaptor for ACT policy
-- ``detr`` Model definitions of ACT, modified from DETR
-- ``sim_env.py`` Mujoco + DM_Control environments with joint space control
-- ``ee_sim_env.py`` Mujoco + DM_Control environments with EE space control
-- ``scripted_policy.py`` Scripted policies for sim environments
-- ``constants.py`` Constants shared across files
-- ``utils.py`` Utils such as data loading and helper functions
-- ``visualize_episodes.py`` Save videos from a .hdf5 dataset
+# Install LIBERO (needed for LIBERO tasks)
+cd ..
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+cd LIBERO
+pip install -e .
+```
 
+When running, make sure LIBERO is on your path:
+```bash
+export PYTHONPATH=/path/to/LIBERO:$PYTHONPATH
+```
 
-### Installation
+## Evaluation Protocol
 
-    conda create -n aloha python=3.8.10
-    conda activate aloha
-    pip install torchvision
-    pip install torch
-    pip install pyquaternion
-    pip install pyyaml
-    pip install rospkg
-    pip install pexpect
-    pip install mujoco==2.3.7
-    pip install dm_control==1.0.14
-    pip install opencv-python
-    pip install matplotlib
-    pip install einops
-    pip install packaging
-    pip install h5py
-    pip install ipython
-    cd act/detr && pip install -e .
+Per-suite multi-task training and evaluation on LIBERO, following the protocol used by OpenVLA-OFT, pi0, Dream-VLA, and MM-ACT:
 
-### Example Usages
+- Train one policy on all 10 tasks within a single suite (50 demos per task)
+- Evaluate on the same 10 tasks with different initial conditions (20 rollouts per task)
+- Report per-task success rates and suite average
+- Repeat for each suite, then average across suites for the headline number
 
-To set up a new terminal, run:
+| Suite | # Tasks | Episode Length | Description |
+|---|---|---|---|
+| LIBERO-Spatial | 10 | 300 | Spatial relationship reasoning |
+| LIBERO-Object | 10 | 300 | Object recognition/manipulation |
+| LIBERO-Goal | 10 | 300 | Goal-conditioned manipulation |
+| LIBERO-Long | 10 | 600 | Long-horizon multi-step tasks |
 
-    conda activate aloha
-    cd <path to act repo>
+## Running Experiments
 
-### Simulated experiments
+### Step 0: Train FAST tokenizer (once)
 
-We use ``sim_transfer_cube_scripted`` task in the examples below. Another option is ``sim_insertion_scripted``.
-To generated 50 episodes of scripted data, run:
+```bash
+python tokenizer.py \
+    --dataset_path /path/to/libero_90 \
+    --save_path ./fast_tokenizer \
+    --chunk_size 50 --action_dim 7
+```
 
-    python3 record_sim_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --dataset_dir <data save dir> \
-    --num_episodes 50
+### Per-suite training + eval
 
-To can add the flag ``--onscreen_render`` to see real-time rendering.
-To visualize the episode after it is collected, run
+Both job scripts take a suite name as an argument and run training followed by evaluation.
 
-    python3 visualize_episodes.py --dataset_dir <data save dir> --episode_idx 0
+```bash
+# ACT baseline (continuous actions)
+sbatch job.sh libero_spatial
+sbatch job.sh libero_object
+sbatch job.sh libero_goal
+sbatch job.sh libero_10          # LIBERO-Long
 
-To train ACT:
-    
-    # Transfer Cube task
-    python3 imitate_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --ckpt_dir <ckpt dir> \
-    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-    --num_epochs 2000  --lr 1e-5 \
-    --seed 0
+# ACT + FAST tokens
+sbatch job_actFAST.sh libero_spatial
+sbatch job_actFAST.sh libero_object
+sbatch job_actFAST.sh libero_goal
+sbatch job_actFAST.sh libero_10  # LIBERO-Long
+```
 
+Checkpoints are saved to `checkpoints/{suite}_act/` and `checkpoints/{suite}_act_fast/`.
 
-To evaluate the policy, run the same command but add ``--eval``. This loads the best validation checkpoint.
-The success rate should be around 90% for transfer cube, and around 50% for insertion.
-To enable temporal ensembling, add flag ``--temporal_agg``.
-Videos will be saved to ``<ckpt_dir>`` for each rollout.
-You can also add ``--onscreen_render`` to see real-time rendering during evaluation.
+Evaluation results are written to `checkpoints/{suite}_{variant}/eval_all_tasks.txt`.
 
-For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
-Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
+## Swapping tokenizers
 
+The tokenizer is pluggable via the `ActionTokenizer` base class in `tokenizer.py`. To add a new one, subclass it and decorate with `@register_tokenizer`. The rest of the codebase loads tokenizers via `load_tokenizer(path)` which auto-dispatches based on a saved type marker.
+
+## Repo Structure
+- `imitate_episodes.py` — Train and evaluate ACT
+- `policy.py` — ACT policy wrapper
+- `tokenizer.py` — Action tokenizer interface + FAST+ implementation
+- `detr/` — Model definitions (DETRVAE), modified from DETR
+- `constants.py` — Task configs and constants
+- `utils.py` — Data loading (continuous + tokenized)
+- `job.sh` — SLURM job for ACT baseline (per-suite)
+- `job_actFAST.sh` — SLURM job for ACT + FAST tokens (per-suite)

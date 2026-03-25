@@ -36,27 +36,39 @@ SIM_TASK_CONFIGS = {
 # dataset_path: path to a single .hdf5 file or a directory of .hdf5 files
 # camera_names: must match keys under /data/demo_X/obs/ in the HDF5 files
 LIBERO_TASK_CONFIGS = {
-    # --- LIBERO-90 (all tasks in the directory) ---
-    'libero_90': {
-        'dataset_path': DATA_DIR + '/libero/libero_90',
+    # --- Per-suite benchmarks (10 tasks each, 50 demos/task) ---
+    'libero_spatial': {
+        'dataset_path': DATA_DIR + '/libero/libero_spatial',
         'episode_len': 300,
         'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
         'state_dim': 9,   # joint_states(7) + gripper_states(2)
         'action_dim': 7,  # 6 DOF delta EE + 1 gripper
     },
-
-    # --- LIBERO-10 (all tasks in the directory) ---
-    'libero_10': {
-        'dataset_path': DATA_DIR + '/libero/libero_10',
+    'libero_object': {
+        'dataset_path': DATA_DIR + '/libero/libero_object',
         'episode_len': 300,
         'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
         'state_dim': 9,
         'action_dim': 7,
     },
+    'libero_goal': {
+        'dataset_path': DATA_DIR + '/libero/libero_goal',
+        'episode_len': 300,
+        'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
+        'state_dim': 9,
+        'action_dim': 7,
+    },
+    'libero_10': {  # "LIBERO-Long" in papers
+        'dataset_path': DATA_DIR + '/libero/libero_10',
+        'episode_len': 600,
+        'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
+        'state_dim': 9,
+        'action_dim': 7,
+    },
 
-    # --- Example: single LIBERO task ---
-    'libero_kitchen_scene1_open_bottom_drawer': {
-        'dataset_path': DATA_DIR + '/libero/libero_90/KITCHEN_SCENE1_open_the_bottom_drawer_of_the_cabinet_demo.hdf5',
+    # --- Full LIBERO-90 (for reference / pretraining) ---
+    'libero_90': {
+        'dataset_path': DATA_DIR + '/libero/libero_90',
         'episode_len': 300,
         'camera_names': ['agentview_rgb', 'eye_in_hand_rgb'],
         'state_dim': 9,

@@ -9,7 +9,7 @@ from tqdm import tqdm
 from einops import rearrange
 
 from constants import DT
-from utils import compute_dict_mean, set_seed, detach_dict # helper functions
+from utils import compute_dict_mean, set_seed, detach_dict
 from policy import ACTPolicy, CNNMLPPolicy
 
 import IPython
@@ -17,7 +17,6 @@ e = IPython.embed
 
 def main(args):
     set_seed(1)
-    # command line parameters
     is_eval = args['eval']
     ckpt_dir = args['ckpt_dir']
     policy_class = args['policy_class']
@@ -26,6 +25,8 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
+    use_fast_tokens = args.get('use_fast_tokens', False)
+    fast_tokenizer_path = args.get('fast_tokenizer_path', None)
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
@@ -58,6 +59,25 @@ def main(args):
         state_dim = 14
         action_dim = 14
 
+    # Load action tokenizer if using tokenized mode
+    fast_wrapper = None
+    if use_fast_tokens:
+        from tokenizer import load_tokenizer
+        assert fast_tokenizer_path is not None, "Must provide --fast_tokenizer_path when using --use_fast_tokens"
+        fast_wrapper = load_tokenizer(fast_tokenizer_path)
+        print(f"Loaded action tokenizer ({type(fast_wrapper).__name__}) from {fast_tokenizer_path}")
+        print(f"  vocab_size={fast_wrapper.vocab_size}, max_token_len={fast_wrapper.max_token_len}")
+        print(f"  pad_token_id={fast_wrapper.pad_token_id}")
+        # Sanity check: verify encode→decode round-trip
+        _test_chunk = np.random.RandomState(0).randn(fast_wrapper.chunk_size, action_dim).astype(np.float32) * 0.1
+        _test_chunk = _test_chunk * fast_wrapper.action_scale + fast_wrapper.action_offset
+        _tok, _tlen = fast_wrapper.encode(_test_chunk)
+        _recon = fast_wrapper.decode(_tok.unsqueeze(0), _tlen.unsqueeze(0))[0]
+        _err = np.abs(_test_chunk - _recon).mean()
+        print(f"  [SANITY] encode→decode round-trip MAE: {_err:.6f}")
+        print(f"  [SANITY] original action[0]: {_test_chunk[0]}")
+        print(f"  [SANITY] reconstructed action[0]: {_recon[0]}")
+
     # fixed parameters
     lr_backbone = 1e-5
     backbone = 'resnet18'
@@ -78,13 +98,16 @@ def main(args):
                          'camera_names': camera_names,
                          'state_dim': state_dim,
                          'action_dim': action_dim,
+                         'use_fast_tokens': use_fast_tokens,
                          }
+        if use_fast_tokens:
+            # +1 because pad_token_id = vocab_size (out-of-vocab)
+            policy_config['fast_vocab_size'] = fast_wrapper.vocab_size + 1
+            policy_config['fast_max_token_len'] = fast_wrapper.max_token_len
+            policy_config['fast_pad_token_id'] = fast_wrapper.pad_token_id
     elif policy_class == 'CNNMLP':
-        policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names,
-                         'state_dim': state_dim,
-                         'action_dim': action_dim,
-                         }
+        policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone': backbone, 'num_queries': 1,
+                         'camera_names': camera_names, 'state_dim': state_dim, 'action_dim': action_dim}
     else:
         raise NotImplementedError
 
@@ -104,25 +127,64 @@ def main(args):
         'camera_names': camera_names,
         'real_robot': not is_sim and not is_libero,
         'is_libero': is_libero,
+        'resume_ckpt': args.get('resume', None),
+        'use_fast_tokens': use_fast_tokens,
+        'fast_wrapper': fast_wrapper,
     }
 
     if is_eval:
-        ckpt_names = [f'policy_best.ckpt']
-        results = []
-        for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
-            results.append([ckpt_name, success_rate, avg_return])
+        ckpt_name = 'policy_best.ckpt'
 
-        for ckpt_name, success_rate, avg_return in results:
+        if is_libero:
+            from libero.libero import benchmark
+            benchmark_dict = benchmark.get_benchmark_dict()
+            suite_name = task_name if task_name in benchmark_dict else 'libero_90'
+            task_suite = benchmark_dict[suite_name]()
+            num_tasks = task_suite.n_tasks
+
+            all_results = []
+            for task_id in range(num_tasks):
+                task_desc = task_suite.get_task(task_id).language
+                print(f'\n{"="*60}')
+                print(f'Evaluating task {task_id}/{num_tasks}: {task_desc}')
+                print(f'{"="*60}')
+                success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True, task_id=task_id)
+                all_results.append([task_id, task_desc, success_rate, avg_return])
+
+            print(f'\n{"="*60}')
+            print(f'EVALUATION SUMMARY — {suite_name} ({num_tasks} tasks)')
+            print(f'{"="*60}')
+            total_success = 0
+            for task_id, desc, sr, ar in all_results:
+                print(f'  Task {task_id:2d} | SR: {sr:.2f} | {desc}')
+                total_success += sr
+            avg_success = total_success / num_tasks
+            print(f'{"="*60}')
+            print(f'  Average success rate: {avg_success:.3f}')
+            print(f'{"="*60}')
+
+            result_path = os.path.join(ckpt_dir, f'eval_all_tasks.txt')
+            with open(result_path, 'w') as f:
+                for task_id, desc, sr, ar in all_results:
+                    f.write(f'Task {task_id:2d} | SR: {sr:.2f} | Return: {ar:.2f} | {desc}\n')
+                f.write(f'\nAverage success rate: {avg_success:.3f}\n')
+            print(f'Results saved to {result_path}')
+        else:
+            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
             print(f'{ckpt_name}: {success_rate=} {avg_return=}')
         print()
         exit()
 
     # Load data
     if is_libero:
-        from utils import load_libero_data
-        train_dataloader, val_dataloader, stats, _ = load_libero_data(
-            dataset_path, camera_names, batch_size_train, chunk_size=args['chunk_size'])
+        if use_fast_tokens:
+            from utils import load_libero_data_tokenized
+            train_dataloader, val_dataloader, stats, _ = load_libero_data_tokenized(
+                dataset_path, camera_names, batch_size_train, fast_wrapper)
+        else:
+            from utils import load_libero_data
+            train_dataloader, val_dataloader, stats, _ = load_libero_data(
+                dataset_path, camera_names, batch_size_train, chunk_size=args['chunk_size'])
     else:
         from utils import load_data
         train_dataloader, val_dataloader, stats, _ = load_data(
@@ -138,7 +200,6 @@ def main(args):
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
-    # save best checkpoint
     ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
@@ -165,7 +226,6 @@ def make_optimizer(policy_class, policy):
 
 
 def get_image(ts, camera_names):
-    """Extract images from dm_control timestep (for ALOHA sim eval only)."""
     curr_images = []
     for cam_name in camera_names:
         curr_image = rearrange(ts.observation['images'][cam_name], 'h w c -> c h w')
@@ -176,8 +236,6 @@ def get_image(ts, camera_names):
 
 
 def get_libero_image(obs, camera_names):
-    """Extract images from LIBERO obs dict."""
-    # LIBERO camera name mapping: the obs dict uses different keys than the HDF5
     libero_cam_key_map = {
         'agentview_rgb': 'agentview_image',
         'eye_in_hand_rgb': 'robot0_eye_in_hand_image',
@@ -192,13 +250,15 @@ def get_libero_image(obs, camera_names):
     return curr_image
 
 
-def eval_bc(config, ckpt_name, save_episode=True):
+def eval_bc(config, ckpt_name, save_episode=True, task_id=0):
     set_seed(1000)
     ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     action_dim = config['action_dim']
     real_robot = config['real_robot']
     is_libero = config.get('is_libero', False)
+    use_fast_tokens = config.get('use_fast_tokens', False)
+    fast_wrapper = config.get('fast_wrapper', None)
     policy_class = config['policy_class']
     onscreen_render = config['onscreen_render']
     policy_config = config['policy_config']
@@ -207,7 +267,6 @@ def eval_bc(config, ckpt_name, save_episode=True):
     task_name = config['task_name']
     temporal_agg = config['temporal_agg']
 
-    # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
     loading_status = policy.load_state_dict(torch.load(ckpt_path))
@@ -222,37 +281,19 @@ def eval_bc(config, ckpt_name, save_episode=True):
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
 
-    # load environment
     if is_libero:
         from libero.libero import benchmark
         from libero.libero.envs import OffScreenRenderEnv
         from libero.libero import get_libero_path
-
-        # Determine suite and task_id from task_name
-        # You may need to customize this mapping for your specific task
         benchmark_dict = benchmark.get_benchmark_dict()
-        # Default to libero_90 suite; adjust as needed
-        suite_name = task_name  # e.g. 'libero_90', 'libero_10'
-        if suite_name not in benchmark_dict:
-            # Try extracting suite from task name, or default
-            suite_name = 'libero_90'
+        suite_name = task_name if task_name in benchmark_dict else 'libero_90'
         task_suite = benchmark_dict[suite_name]()
-        task_id = 0  # TODO: set this based on your specific task
-
         task = task_suite.get_task(task_id)
-        task_bddl_file = os.path.join(
-            get_libero_path("bddl_files"),
-            task.problem_folder,
-            task.bddl_file
-        )
-        env = OffScreenRenderEnv(
-            bddl_file_name=task_bddl_file,
-            camera_heights=128,
-            camera_widths=128
-        )
+        task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+        env = OffScreenRenderEnv(bddl_file_name=task_bddl_file, camera_heights=128, camera_widths=128)
         env.seed(0)
         init_states = task_suite.get_task_init_states(task_id)
-        env_max_reward = 1  # LIBERO uses sparse reward: 1 on success
+        env_max_reward = 1
     elif real_robot:
         from aloha_scripts.robot_utils import move_grippers
         from aloha_scripts.real_env import make_real_env
@@ -264,29 +305,27 @@ def eval_bc(config, ckpt_name, save_episode=True):
         env_max_reward = env.task.max_reward
 
     query_frequency = policy_config['num_queries']
-    if temporal_agg:
+    if use_fast_tokens:
+        # With FAST tokens, we re-predict every chunk_size steps
+        query_frequency = fast_wrapper.chunk_size
+    if temporal_agg and not use_fast_tokens:
         query_frequency = 1
         num_queries = policy_config['num_queries']
 
-    max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
+    max_timesteps = int(max_timesteps * 1)
 
-    num_rollouts = 50
+    num_rollouts = 20 if is_libero else 50
     episode_returns = []
     highest_rewards = []
     for rollout_id in range(num_rollouts):
-        rollout_id += 0
-
         if is_libero:
-            ### LIBERO environment reset
             env.reset()
             init_state_id = rollout_id % len(init_states)
             env.set_init_state(init_states[init_state_id])
-            # Step a few times to let environment settle
             dummy_action = [0.] * 7
             for _ in range(10):
                 obs, _, _, _ = env.step(dummy_action)
         else:
-            ### ALOHA sim environment reset
             if 'sim_transfer_cube' in task_name:
                 from sim_env import BOX_POSE
                 from utils import sample_box_pose
@@ -295,53 +334,65 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 from sim_env import BOX_POSE
                 from utils import sample_insertion_pose
                 BOX_POSE[0] = np.concatenate(sample_insertion_pose())
-
             ts = env.reset()
 
-        ### onscreen render (ALOHA sim only)
         if onscreen_render and not is_libero:
             ax = plt.subplot()
             plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id='angle'))
             plt.ion()
 
-        ### evaluation loop
-        if temporal_agg:
+        if temporal_agg and not use_fast_tokens:
             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, action_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-        image_list = [] # for visualization
+        image_list = []
         qpos_list = []
         target_qpos_list = []
         rewards = []
 
+        # For FAST tokens: store the current action chunk being executed
+        current_action_chunk = None
+        chunk_step = 0
+
         with torch.inference_mode():
             for t in range(max_timesteps):
-                ### process observations
                 if is_libero:
-                    # LIBERO obs
-                    qpos_numpy = np.concatenate([
-                        obs['robot0_joint_pos'],      # (7,)
-                        obs['robot0_gripper_qpos'],   # (2,)
-                    ])
+                    qpos_numpy = np.concatenate([obs['robot0_joint_pos'], obs['robot0_gripper_qpos']])
                     qpos = pre_process(qpos_numpy)
                     qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                     curr_image = get_libero_image(obs, camera_names)
                 else:
-                    # ALOHA obs
-                    obs = ts.observation
-                    if 'images' in obs:
-                        image_list.append(obs['images'])
+                    obs_dict = ts.observation
+                    if 'images' in obs_dict:
+                        image_list.append(obs_dict['images'])
                     else:
-                        image_list.append({'main': obs['image']})
-                    qpos_numpy = np.array(obs['qpos'])
+                        image_list.append({'main': obs_dict['image']})
+                    qpos_numpy = np.array(obs_dict['qpos'])
                     qpos = pre_process(qpos_numpy)
                     qpos = torch.from_numpy(qpos).float().cuda().unsqueeze(0)
                     curr_image = get_image(ts, camera_names)
 
                 qpos_history[:, t] = qpos
 
-                ### query policy
-                if config['policy_class'] == "ACT":
+                if use_fast_tokens:
+                    # Re-predict every chunk_size steps
+                    if current_action_chunk is None or chunk_step >= fast_wrapper.chunk_size:
+                        predicted_tokens, token_lens = policy(qpos, curr_image)  # (1, max_token_len)
+                        # Detokenize to continuous actions
+                        current_action_chunk = fast_wrapper.decode(predicted_tokens.cpu(), token_lens.cpu())[0]  # (chunk_size, action_dim)
+                        chunk_step = 0
+                        # Debug: log decoded actions on first prediction of each rollout
+                        if t == 0:
+                            tl = token_lens[0].item()
+                            toks = predicted_tokens[0, :20].tolist()
+                            print(f"  [DEBUG] token_lens={tl}, first_20_tokens={toks}")
+                            print(f"  [DEBUG] action[0]={current_action_chunk[0]}")
+                            print(f"  [DEBUG] action range: min={current_action_chunk.min():.4f} max={current_action_chunk.max():.4f}")
+                    raw_action = current_action_chunk[chunk_step]
+                    chunk_step += 1
+                    # FAST actions are already in original scale (denormalized in decode)
+                    action = raw_action
+                elif config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
                         all_actions = policy(qpos, curr_image)
                     if temporal_agg:
@@ -356,28 +407,26 @@ def eval_bc(config, ckpt_name, save_episode=True):
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
+                    raw_action = raw_action.squeeze(0).cpu().numpy()
+                    action = post_process(raw_action)
                 elif config['policy_class'] == "CNNMLP":
                     raw_action = policy(qpos, curr_image)
+                    raw_action = raw_action.squeeze(0).cpu().numpy()
+                    action = post_process(raw_action)
                 else:
                     raise NotImplementedError
 
-                ### post-process actions
-                raw_action = raw_action.squeeze(0).cpu().numpy()
-                action = post_process(raw_action)
-
-                ### step the environment
                 if is_libero:
-                    obs, reward, done, info = env.step(action.tolist())
+                    obs, reward, done, info = env.step(action.tolist() if hasattr(action, 'tolist') else list(action))
                     rewards.append(reward)
                     qpos_list.append(qpos_numpy)
                     target_qpos_list.append(action)
                     if done:
                         break
                 else:
-                    target_qpos = action
-                    ts = env.step(target_qpos)
+                    ts = env.step(action)
                     qpos_list.append(qpos_numpy)
-                    target_qpos_list.append(target_qpos)
+                    target_qpos_list.append(action)
                     rewards.append(ts.reward)
 
             plt.close()
@@ -404,24 +453,21 @@ def eval_bc(config, ckpt_name, save_episode=True):
         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
         summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
-
     print(summary_str)
 
-    # save success rate to txt
     result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
     with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
         f.write(summary_str)
         f.write(repr(episode_returns))
         f.write('\n\n')
         f.write(repr(highest_rewards))
-
     return success_rate, avg_return
 
 
 def forward_pass(data, policy):
     image_data, qpos_data, action_data, is_pad = data
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    return policy(qpos_data, image_data, action_data, is_pad)
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -434,6 +480,15 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
+    resume_ckpt = config.get('resume_ckpt', None)
+    if resume_ckpt is not None:
+        print(f'Loading pretrained checkpoint from: {resume_ckpt}')
+        loading_status = policy.load_state_dict(torch.load(resume_ckpt), strict=False)
+        if loading_status.missing_keys:
+            print(f'  Missing keys (randomly initialized): {loading_status.missing_keys}')
+        if loading_status.unexpected_keys:
+            print(f'  Unexpected keys (ignored): {loading_status.unexpected_keys}')
+        print(f'Resume status: {loading_status}')
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
@@ -443,7 +498,6 @@ def train_bc(train_dataloader, val_dataloader, config):
     best_ckpt_info = None
     for epoch in tqdm(range(num_epochs)):
         print(f'\nEpoch {epoch}')
-        # validation
         with torch.inference_mode():
             policy.eval()
             epoch_dicts = []
@@ -452,7 +506,6 @@ def train_bc(train_dataloader, val_dataloader, config):
                 epoch_dicts.append(forward_dict)
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
-
             epoch_val_loss = epoch_summary['loss']
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
@@ -463,12 +516,10 @@ def train_bc(train_dataloader, val_dataloader, config):
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
-        # training
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
             forward_dict = forward_pass(data, policy)
-            # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
@@ -489,20 +540,15 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
-
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
     ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
-
-    # save training curves
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
-
     return best_ckpt_info
 
 
 def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
-    # save training curves
     for key in train_history[0]:
         plot_path = os.path.join(ckpt_dir, f'train_val_{key}_seed_{seed}.png')
         plt.figure()
@@ -510,7 +556,6 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         val_values = [summary[key].item() for summary in validation_history]
         plt.plot(np.linspace(0, num_epochs-1, len(train_history)), train_values, label='train')
         plt.plot(np.linspace(0, num_epochs-1, len(validation_history)), val_values, label='validation')
-        # plt.ylim([-0.1, 1])
         plt.tight_layout()
         plt.legend()
         plt.title(key)
@@ -531,10 +576,15 @@ if __name__ == '__main__':
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # for ACT
-    parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
+    parser.add_argument('--kl_weight', action='store', type=float, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--resume', action='store', type=str, help='path to checkpoint to resume from', required=False, default=None)
+
+    # for FAST tokenization
+    parser.add_argument('--use_fast_tokens', action='store_true', help='Use FAST action tokenization')
+    parser.add_argument('--fast_tokenizer_path', action='store', type=str, help='Path to trained FAST tokenizer', required=False, default=None)
 
     main(vars(parser.parse_args()))
