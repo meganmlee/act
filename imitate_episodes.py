@@ -370,7 +370,7 @@ def eval_bc(config, ckpt_name, save_episode=True, task_id=0):
                     if current_action_chunk is None or chunk_step >= fast_wrapper.chunk_size:
                         predicted_tokens = policy(qpos, curr_image)  # (1, max_token_len)
                         # Detokenize to continuous actions
-                        current_action_chunk = fast_wrapper.decode(predicted_tokens.cpu())  # (chunk_size, action_dim)
+                        current_action_chunk = fast_wrapper.decode(predicted_tokens.cpu())[0]  # (chunk_size, action_dim)
                         chunk_step = 0
                     raw_action = current_action_chunk[chunk_step]
                     chunk_step += 1
