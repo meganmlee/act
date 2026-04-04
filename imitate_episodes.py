@@ -175,7 +175,7 @@ def main(args):
             print(f'EVALUATION SUMMARY — {suite_name} ({len(all_results)} tasks)')
             print(f'{"="*60}')
             total_success = 0
-            for tid, desc, sr, ar in all_results:
+            for tid, desc, sr, _ in all_results:
                 print(f'  Task {tid:2d} | SR: {sr:.2f} | {desc}')
                 total_success += sr
             avg_success = total_success / len(all_results)
@@ -185,8 +185,8 @@ def main(args):
 
             result_path = os.path.join(ckpt_dir, f'eval_all_tasks.txt')
             with open(result_path, 'w') as f:
-                for tid, desc, sr, ar in all_results:
-                    f.write(f'Task {tid:2d} | SR: {sr:.2f} | Return: {ar:.2f} | {desc}\n')
+                for tid, desc, sr, _ in all_results:
+                    f.write(f'Task {tid:2d} | SR: {sr:.2f} | {desc}\n')
                 f.write(f'\nAverage success rate: {avg_success:.3f}\n')
             print(f'Results saved to {result_path}')
         else:
@@ -337,7 +337,7 @@ def eval_bc(config, ckpt_name, save_episode=True, task_id=0):
 
     max_timesteps = int(max_timesteps * 1)
 
-    num_rollouts = 20 if is_libero else 50
+    num_rollouts = 50
     episode_returns = []
     highest_rewards = []
     for rollout_id in range(num_rollouts):
@@ -464,27 +464,21 @@ def eval_bc(config, ckpt_name, save_episode=True, task_id=0):
         episode_returns.append(episode_return)
         episode_highest_reward = np.max(rewards)
         highest_rewards.append(episode_highest_reward)
-        print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
+        print(f'Rollout {rollout_id}\nSuccess: {episode_highest_reward==env_max_reward}')
 
     if is_libero:
         env.close()
 
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
-    avg_return = np.mean(episode_returns)
-    summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
-    for r in range(int(env_max_reward)+1):
-        more_or_equal_r = (np.array(highest_rewards) >= r).sum()
-        more_or_equal_r_rate = more_or_equal_r / num_rollouts
-        summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
+    num_success = int(np.sum(np.array(highest_rewards) == env_max_reward))
+    summary_str = f'\nSuccess rate: {success_rate} ({num_success}/{num_rollouts})\n'
     print(summary_str)
 
     result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
     with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
         f.write(summary_str)
-        f.write(repr(episode_returns))
-        f.write('\n\n')
         f.write(repr(highest_rewards))
-    return success_rate, avg_return
+    return success_rate, success_rate
 
 
 def forward_pass(data, policy):
