@@ -1,19 +1,45 @@
-# ACT-Tokenizer: Action Chunking with Transformers + Discrete Tokenization + Language Conditioning
+# ACT-Tokenizer: Action Chunking with Transformers + Language Conditioning + Discrete Tokenization
 
 Fork of [ACT](https://tonyzhaozh.github.io/aloha/) with two extensions that can be used independently or together:
 
-1. **FAST-ACT** -- Discrete action tokenization via FAST+. The CVAE encoder embeds discrete tokens instead of raw actions, and the decoder predicts token logits. After decoding, tokens are detokenized back to continuous actions.
-2. **LAV-ACT** -- Language-conditioned ACT. A frozen CLIP text encoder extracts a task embedding (e.g. "pick up the ketchup"), which is projected and concatenated as an extra token in the transformer sequence. This lets a single model handle multiple tasks.
+1. **LAV-ACT** -- Language-conditioned ACT. A frozen CLIP text encoder extracts a task embedding (e.g. "pick up the ketchup"), which is projected and concatenated as an extra token in the transformer sequence. This lets a single model handle multiple tasks.
+2. **FAST-ACT** -- Discrete action tokenization via FAST+. The CVAE encoder embeds discrete tokens instead of raw actions, and the decoder predicts token logits. After decoding, tokens are detokenized back to continuous actions.
+
+These compose: LAV-ACT + FAST gives language-conditioned multi-task training with discrete action tokens.
 
 ## Variants
 
-| Variant | Tokenization | Language | Training | Flag(s) |
-|---------|-------------|----------|----------|---------|
+| Variant | Actions | Language | Training | Flag(s) |
+|---------|---------|----------|----------|---------|
 | ACT (baseline) | Continuous | No | Per-task | _(none)_ |
+| LAV-ACT | Continuous | CLIP | Multi-task | `--use_language` |
 | FAST-ACT | FAST discrete | No | Per-task | `--use_fast_tokens` |
-| LAV-ACT | FAST discrete | CLIP | Multi-task | `--use_fast_tokens --use_language` |
+| LAV-ACT + FAST | FAST discrete | CLIP | Multi-task | `--use_language --use_fast_tokens` |
 
-LAV-ACT can also be used with continuous actions (`--use_language` without `--use_fast_tokens`), but the intended configuration is FAST + language.
+## Architecture
+
+### ACT baseline
+- **CVAE encoder**: `[CLS, qpos, actions]` -> latent z
+- **Decoder memory**: `[latent, proprio, image_feats]`
+- Action queries cross-attend to memory -> continuous action predictions (L1 loss)
+
+### LAV-ACT
+Adds a frozen CLIP text token to both encoder and decoder:
+- **CVAE encoder**: `[CLS, text_token, qpos, actions]`
+- **Decoder memory**: `[latent, proprio, text_token, image_feats]`
+- Text token = `Linear(CLIP_text_encoder(task_string))` (CLIP is frozen, projection is learned)
+- Still continuous actions, same L1 loss
+
+### FAST-ACT
+Same architecture as ACT, but actions are discrete BPE tokens (DCT + BPE encoding):
+- Encoder embeds tokens via `nn.Embedding` instead of linear projection
+- Decoder predicts token logits (cross-entropy loss instead of L1)
+
+### LAV-ACT + FAST
+Combines both: language token in the sequence + discrete action tokens.
+- **CVAE encoder**: `[CLS, text_token, qpos, action_tokens]`
+- **Decoder memory**: `[latent, proprio, text_token, image_feats]`
+- Cross-entropy loss over discrete token vocabulary
 
 ## Setup
 
@@ -26,7 +52,7 @@ pip install torch torchvision
 pip install pyquaternion pyyaml rospkg pexpect
 pip install mujoco==2.3.7 dm_control==1.0.14
 pip install opencv-python matplotlib einops packaging h5py ipython
-pip install transformers  # for FAST tokenizer + CLIP text encoder
+pip install transformers  # for CLIP text encoder + FAST tokenizer
 
 # Install DETR
 cd detr && pip install -e . && cd ..
@@ -47,8 +73,8 @@ export PYTHONPATH=/path/to/LIBERO:$PYTHONPATH
 
 Per-suite training and evaluation on LIBERO, following the protocol used by OpenVLA-OFT, pi0, Dream-VLA, and MM-ACT:
 
-- **ACT / FAST-ACT**: Train one policy per task (10 separate models per suite)
-- **LAV-ACT**: Train one policy across all 10 tasks in a suite (single model, language-conditioned)
+- **ACT / FAST-ACT**: Train one policy per task (10 separate models per suite via SLURM array)
+- **LAV-ACT / LAV-ACT+FAST**: Train one policy across all 10 tasks (single model, language-conditioned)
 - Evaluate on the same 10 tasks with different initial conditions (50 rollouts per task)
 - Report per-task success rates and suite average
 
@@ -61,7 +87,7 @@ Per-suite training and evaluation on LIBERO, following the protocol used by Open
 
 ## Running Experiments
 
-### Step 0: Train FAST tokenizer (once, needed for FAST-ACT and LAV-ACT)
+### Step 0: Train FAST tokenizer (once, only needed for FAST variants)
 
 ```bash
 python tokenizer.py \
@@ -74,55 +100,33 @@ python tokenizer.py \
 
 ```bash
 sbatch job.sh libero_spatial
-sbatch job.sh libero_object
-sbatch job.sh libero_goal
-sbatch job.sh libero_10
+```
+
+### LAV-ACT (multi-task, continuous actions + CLIP language)
+
+```bash
+sbatch job_LACT.sh libero_spatial
 ```
 
 ### FAST-ACT (per-task, discrete tokens)
 
 ```bash
 sbatch job_actFAST.sh libero_spatial
-sbatch job_actFAST.sh libero_object
-sbatch job_actFAST.sh libero_goal
-sbatch job_actFAST.sh libero_10
 ```
 
-### LAV-ACT (multi-task, FAST tokens + CLIP language)
+To add language conditioning on top (LAV-ACT + FAST), uncomment `LANG_ARGS` in `job_actFAST.sh`, remove the `--array` SBATCH header, and remove `--task_id`.
 
-```bash
-sbatch job_LACT.sh libero_spatial
-sbatch job_LACT.sh libero_object
-sbatch job_LACT.sh libero_goal
-sbatch job_LACT.sh libero_10
-```
+All suites: `libero_spatial`, `libero_object`, `libero_goal`, `libero_10`
 
 ### Evaluation
 
-Eval is included in each job script as a commented-out block. Uncomment it to run eval after training completes, or submit it separately after the training job finishes.
+Eval is included at the bottom of each job script as a commented-out block. Uncomment it to run eval after training completes.
 
 Checkpoints and eval results are saved to:
 - `checkpoints/{suite}_act/` -- ACT baseline (per-task subdirs)
-- `checkpoints/{suite}_act_fast/` -- FAST-ACT (per-task subdirs)
 - `checkpoints/{suite}_lact/` -- LAV-ACT (single model)
-
-## Architecture
-
-### ACT baseline
-- **CVAE encoder**: `[CLS, qpos, action_0, ..., action_N]` -> latent z
-- **Decoder memory**: `[latent, proprio, image_feat_0, ..., image_feat_HW]`
-- Action queries cross-attend to memory -> continuous action predictions
-
-### FAST-ACT
-Same architecture, but actions are discrete BPE tokens (DCT + BPE encoding).
-- Encoder embeds tokens via `nn.Embedding` instead of linear projection
-- Decoder predicts token logits via cross-entropy instead of L1 loss
-
-### LAV-ACT
-Adds a frozen CLIP text token to both the encoder and decoder:
-- **CVAE encoder**: `[CLS, text_token, qpos, action_tokens]`
-- **Decoder memory**: `[latent, proprio, text_token, image_feats]`
-- The text token is: `Linear(CLIP_text_encoder(task_string))` (CLIP is frozen, projection is learned)
+- `checkpoints/{suite}_act_fast/` -- FAST-ACT (per-task subdirs)
+- `checkpoints/{suite}_act_fast/` -- LAV-ACT + FAST (when LANG_ARGS enabled)
 
 ## Swapping tokenizers
 
@@ -135,6 +139,7 @@ The tokenizer is pluggable via the `ActionTokenizer` base class in `tokenizer.py
 - `detr/` -- Model definitions (DETRVAE), modified from DETR
 - `constants.py` -- Task configs and constants
 - `utils.py` -- Data loading (continuous + tokenized + language)
-- `job.sh` -- SLURM job for ACT baseline (per-task, includes eval)
-- `job_actFAST.sh` -- SLURM job for FAST-ACT (per-task, includes eval)
-- `job_LACT.sh` -- SLURM job for LAV-ACT (multi-task, includes eval)
+- `job.sh` -- ACT baseline (per-task)
+- `job_LACT.sh` -- LAV-ACT (multi-task, continuous + language)
+- `job_actFAST.sh` -- FAST-ACT (per-task, discrete tokens)
+- `eval.sh` / `eval_fast.sh` -- Standalone eval scripts (legacy)

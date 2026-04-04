@@ -19,6 +19,11 @@ export PYTHONPATH=/ocean/projects/cis260038p/mlee12/ACT-Tokenizer/detr:/ocean/pr
 POLICY_ARGS="--policy_class ACT --kl_weight 0.01 --chunk_size 50 --hidden_dim 512 --dim_feedforward 3200 --seed 0 --temporal_agg"
 FAST_ARGS="--use_fast_tokens --fast_tokenizer_path ./fast_tokenizer"
 
+# Uncomment to enable language conditioning (LAV-ACT + FAST)
+# When using language, remove --array and --task_id above to train multi-task
+# LANG_ARGS="--use_language"
+LANG_ARGS=""
+
 ###############################################################################
 # STEP 0: Train FAST tokenizer on LIBERO action data (run once)
 #         Skip this if you already have ./fast_tokenizer/
@@ -34,6 +39,9 @@ FAST_ARGS="--use_fast_tokens --fast_tokenizer_path ./fast_tokenizer"
 # Per-task training with SLURM job array (10 tasks train in parallel)
 # Usage: sbatch job_actFAST.sh libero_spatial
 # Suites: libero_spatial, libero_object, libero_goal, libero_10
+#
+# For LAV-ACT + FAST (multi-task): uncomment LANG_ARGS above,
+# comment out --array in SBATCH header, and remove --task_id below.
 ###############################################################################
 
 SUITE=${1:-libero_spatial}
@@ -49,6 +57,7 @@ python3 imitate_episodes.py \
     --ckpt_dir ./checkpoints/${SUITE}_act_fast/task_${TASK_ID} \
     $POLICY_ARGS \
     $FAST_ARGS \
+    $LANG_ARGS \
     --batch_size 32 \
     --num_epochs 800 \
     --lr 5e-4
@@ -66,6 +75,7 @@ python3 imitate_episodes.py \
 #         --ckpt_dir ./checkpoints/${SUITE}_act_fast \
 #         $POLICY_ARGS \
 #         $FAST_ARGS \
+#         $LANG_ARGS \
 #         --batch_size 32 \
 #         --num_epochs 800 \
 #         --lr 5e-4 \

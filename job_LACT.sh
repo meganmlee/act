@@ -14,13 +14,12 @@ conda activate /ocean/projects/cis260038p/mlee12/envs/aloha
 
 export PYTHONPATH=/ocean/projects/cis260038p/mlee12/ACT-Tokenizer/detr:/ocean/projects/cis260038p/mlee12/LIBERO:$PYTHONPATH
 
-# Shared args
-POLICY_ARGS="--policy_class ACT --kl_weight 0.01 --chunk_size 50 --hidden_dim 512 --dim_feedforward 3200 --seed 0 --temporal_agg"
-FAST_ARGS="--use_fast_tokens --fast_tokenizer_path ./fast_tokenizer"
+# Shared args — continuous actions, language-conditioned
+POLICY_ARGS="--policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --dim_feedforward 3200 --seed 0 --temporal_agg"
 LANG_ARGS="--use_language"
 
 ###############################################################################
-# LAV-ACT: Language-conditioned ACT with FAST tokenization
+# LAV-ACT: Language-conditioned ACT with continuous actions
 # Trains a SINGLE model across all 10 tasks in a suite (no job array).
 # The frozen CLIP text embedding tells the model which task to perform.
 #
@@ -38,11 +37,10 @@ python3 imitate_episodes.py \
     --task_name ${SUITE} \
     --ckpt_dir ./checkpoints/${SUITE}_lact \
     $POLICY_ARGS \
-    $FAST_ARGS \
     $LANG_ARGS \
-    --batch_size 32 \
+    --batch_size 8 \
     --num_epochs 2000 \
-    --lr 5e-4
+    --lr 1e-5
 
 ###############################################################################
 # Evaluation — uncomment below to run after training
@@ -55,9 +53,8 @@ python3 imitate_episodes.py \
 #     --task_name ${SUITE} \
 #     --ckpt_dir ./checkpoints/${SUITE}_lact \
 #     $POLICY_ARGS \
-#     $FAST_ARGS \
 #     $LANG_ARGS \
-#     --batch_size 32 \
+#     --batch_size 8 \
 #     --num_epochs 2000 \
-#     --lr 5e-4 \
+#     --lr 1e-5 \
 #     --eval
