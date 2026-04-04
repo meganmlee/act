@@ -8,12 +8,12 @@
 #SBATCH --output=logs/act_libero_%A_%a.out
 #SBATCH --error=logs/act_libero_%A_%a.err
 
-cd /ocean/projects/cis260038p/mlee12/act
+cd /ocean/projects/cis260038p/mlee12/ACT-Tokenizer
 
 module load anaconda3
 conda activate /ocean/projects/cis260038p/mlee12/envs/aloha
 
-export PYTHONPATH=/ocean/projects/cis260038p/mlee12/LIBERO:$PYTHONPATH
+export PYTHONPATH=/ocean/projects/cis260038p/mlee12/ACT-Tokenizer/detr:/ocean/projects/cis260038p/mlee12/LIBERO:$PYTHONPATH
 
 # Shared args (updated to match ACT paper hyperparams)
 POLICY_ARGS="--policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --dim_feedforward 3200 --seed 0 --temporal_agg"
