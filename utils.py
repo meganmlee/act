@@ -357,11 +357,18 @@ def load_libero_data(dataset_path, camera_names, batch_size, chunk_size, task_id
     return train_loader, val_loader, stats, full_dataset
 
 
-def load_libero_data_tokenized(dataset_path, camera_names, batch_size, fast_wrapper):
-    """Load LIBERO data with FAST-tokenized actions."""
-    print(f'\nLIBERO FAST-tokenized data from: {dataset_path}\n')
-    stats = get_libero_norm_stats(dataset_path, camera_names)
-    full_dataset = LIBEROTokenizedDataset(dataset_path, camera_names, stats, fast_wrapper)
+def load_libero_data_tokenized(dataset_path, camera_names, batch_size, fast_wrapper, task_id=None):
+    """Load LIBERO data with FAST-tokenized actions.
+    If task_id is given, only load that task's HDF5 file."""
+    if task_id is not None and os.path.isdir(dataset_path):
+        hdf5_files = sorted(glob.glob(os.path.join(dataset_path, '*.hdf5')))
+        single_hdf5 = hdf5_files[task_id]
+        print(f'\nLIBERO FAST-tokenized data from: {single_hdf5}  (task_id={task_id})\n')
+    else:
+        single_hdf5 = dataset_path
+        print(f'\nLIBERO FAST-tokenized data from: {dataset_path}\n')
+    stats = get_libero_norm_stats(dataset_path, camera_names, task_id=task_id)
+    full_dataset = LIBEROTokenizedDataset(single_hdf5, camera_names, stats, fast_wrapper)
     print(f'Total LIBERO tokenized samples (demos): {len(full_dataset)}')
     train_size = int(0.9 * len(full_dataset))
     val_size = len(full_dataset) - train_size
